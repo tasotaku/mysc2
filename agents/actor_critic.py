@@ -11,43 +11,110 @@ from pysc2.lib import actions, features, units
 from pysc2.env import sc2_env, run_loop
 from absl import app
 
-class PolicyNet(nn.Module):
-    def __init__(self, state_size, action_size,):
+class SharedFeatureExtractor(nn.Module):
+    def __init__(self, state_size):
         super().__init__()
-        self.l1 = nn.Linear(state_size, 128)
-        self.l2 = nn.Linear(128, action_size)
-
+        self.l1 = nn.Linear(state_size, 256)
+        self.ln1 = nn.LayerNorm(256)
+        self.l2 = nn.Linear(256, 256)
+        self.ln2 = nn.LayerNorm(256)
+        
+        # 残差接続のための層
+        self.residual = nn.Linear(state_size, 256)
+        
     def forward(self, x):
-        x = F.relu(self.l1(x))
-        x = F.softmax(self.l2(x), dim=1)
+        identity = self.residual(x)
+        
+        x = self.l1(x)
+        x = self.ln1(x)
+        x = F.relu(x)
+        x = self.l2(x)
+        x = self.ln2(x)
+        
+        # 残差接続を追加
+        x = x + identity
+        x = F.relu(x)
         return x
 
+class PolicyNet(nn.Module):
+    def __init__(self, state_size, action_size):
+        super().__init__()
+        self.feature_extractor = SharedFeatureExtractor(state_size)
+        
+        self.advantage_hidden = nn.Linear(256, 128)
+        self.ln3 = nn.LayerNorm(128)
+        self.advantage = nn.Linear(128, action_size)
+        
+        # Initialization
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1)
+                layer.bias.data.zero_()
+                
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        
+        advantage = self.advantage_hidden(x)
+        advantage = self.ln3(advantage)
+        advantage = F.relu(advantage)
+        advantage = self.advantage(advantage)
+        
+        # Temperature scaling for better exploration
+        temperature = 1.0
+        x = F.softmax(advantage / temperature, dim=1)
+        return x
 
 class ValueNet(nn.Module):
     def __init__(self, state_size):
         super().__init__()
-        self.l1 = nn.Linear(state_size, 128)
-        self.l2 = nn.Linear(128, 1)
-
+        self.feature_extractor = SharedFeatureExtractor(state_size)
+        
+        self.value_hidden = nn.Linear(256, 128)
+        self.ln3 = nn.LayerNorm(128)
+        self.value = nn.Linear(128, 1)
+        
+        # Initialization
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1)
+                layer.bias.data.zero_()
+                
     def forward(self, x):
-        x = F.relu(self.l1(x))
-        x = self.l2(x)
+        x = self.feature_extractor(x)
+        
+        x = self.value_hidden(x)
+        x = self.ln3(x)
+        x = F.relu(x)
+        x = self.value(x)
         return x
 
 class ACTerranAgent(BaseTerranAgent):
     def __init__(self, state_size, action_size):
         super(ACTerranAgent, self).__init__()
-        self.gamma = 0.98
-        self.lr_pi = 0.0002
-        self.lr_v = 0.0005
+        self.gamma = 0.99
+        self.lr_pi = 0.00001
+        self.lr_v = 0.00002
         self.state_size = state_size
         self.action_size = action_size
+        self.epsilon = 0.2
 
         self.pi = PolicyNet(self.state_size, self.action_size)
         self.v = ValueNet(self.state_size)
 
-        self.optimizer_pi = optim.Adam(self.pi.parameters(), lr=self.lr_pi)
-        self.optimizer_v = optim.Adam(self.v.parameters(), lr=self.lr_v)
+        self.optimizer_pi = torch.optim.AdamW(
+            self.pi.parameters(), 
+            lr=self.lr_pi, 
+            weight_decay=0.01
+        )
+        self.optimizer_v = torch.optim.AdamW(
+            self.v.parameters(), 
+            lr=self.lr_v,
+            weight_decay=0.01
+        )
+
+        # Learning rate scheduler
+        self.scheduler_pi = torch.optim.lr_scheduler.StepLR(self.optimizer_pi, step_size=1000, gamma=0.9)
+        self.scheduler_v = torch.optim.lr_scheduler.StepLR(self.optimizer_v, step_size=1000, gamma=0.9)
         
         self.win_rate_history = []
         self.num_episodes = 0
@@ -162,13 +229,12 @@ class ACTerranAgent(BaseTerranAgent):
         next_state = self.get_state(obs)
         
         if not obs.first():
-            # reward = obs.reward + (0.00001 if next_state[3] > 0 else 0) + (0.00001 if next_state[5] > 0 else 0) + (0.002 if next_state[7] > self.state[7] else 0) + (-0.01 if self.state[7] < 5 and self.action == 5 else 0)
-            reward = obs.reward
+            reward = obs.reward + (0.00001 if next_state[3] > 0 else 0) + (0.00001 if next_state[5] > 0 else 0) + (0.002 if next_state[7] > self.state[7] else 0) + (-0.006 if self.state[7] < 5 and self.action == 5 else 0)
             self.update(self.state, self.prob, reward, next_state, obs.last())
         
         self.state = next_state
         self.action, self.prob = self.get_action(self.state)
-        print(f"Action: {self.action}, Prob: {self.prob:.2f}, Reward: {obs.reward}")
+        # print(f"Action: {self.action}, Prob: {self.prob:.2f}, Reward: {obs.reward}")
         
         if obs.last():
             self.num_episodes += 1
